@@ -92,13 +92,27 @@ function normalize(spec) {
   const stateSet = new Set(names);
   const actions = new Set();
   const out = new Map(names.map((n) => [n, new Map()]));
-  for (const t of spec.transitions) {
-    if (!stateSet.has(t.from) || !stateSet.has(t.to) || typeof t.action !== 'string' || !t.action) continue;
+  // 迁移标识索引：from -> action -> to -> [迁移标识…]（按标识排序，保证复算稳定）
+  const edges = new Map(names.map((n) => [n, new Map()]));
+  const transitions = spec.transitions
+    .filter((t) => t && stateSet.has(t.from) && stateSet.has(t.to) && typeof t.action === 'string' && t.action)
+    .map((t) => ({
+      id: typeof t.id === 'string' ? t.id : '',
+      from: t.from,
+      action: t.action,
+      to: t.to,
+    }))
+    .sort((t1, t2) => (t1.id < t2.id ? -1 : t1.id > t2.id ? 1 : 0));
+  for (const t of transitions) {
     actions.add(t.action);
     if (!out.get(t.from).has(t.action)) out.get(t.from).set(t.action, new Set());
     out.get(t.from).get(t.action).add(t.to);
+    if (!edges.get(t.from).has(t.action)) edges.get(t.from).set(t.action, new Map());
+    const byTo = edges.get(t.from).get(t.action);
+    if (!byTo.has(t.to)) byTo.set(t.to, []);
+    byTo.get(t.to).push(t.id);
   }
-  return { names, stateSet, actions, out, initial: spec.initial };
+  return { names, stateSet, actions, out, edges, transitions, initial: spec.initial };
 }
 
 // ---------- 弱转移 ----------
@@ -134,16 +148,112 @@ function weakTargets(proc, src, action) {
   return result;
 }
 
+// ---------- 候选响应路径：每一步都必须对应一条已录入迁移 ----------
+
+function tauTargetsOf(proc, u) {
+  const ts = proc.out.get(u) && proc.out.get(u).get(TAU);
+  return ts ? [...ts].sort() : [];
+}
+function edgeIdsOf(proc, from, action, to) {
+  const m = proc.edges && proc.edges.get(from);
+  const ids = m && m.get(action) && m.get(action).get(to);
+  return ids || [];
+}
+function makeStep(from, action, to, id) {
+  return { from, action, to, transitionId: id || null };
+}
+
+// BFS 求 src 到 dst 的最短 tau 路径；邻接按状态名排序、平行迁移取最小标识，
+// 因而多条静默前缀时路径仍可确定复算。src === dst 时为零步。
+function tauPath(proc, src, dst) {
+  if (src === dst) return [];
+  const parent = new Map([[src, null]]); // node -> { prev, id }
+  const queue = [src];
+  while (queue.length) {
+    const u = queue.shift();
+    for (const v of tauTargetsOf(proc, u)) {
+      if (!parent.has(v)) {
+        parent.set(v, { prev: u, id: edgeIdsOf(proc, u, TAU, v)[0] || null });
+        queue.push(v);
+      }
+    }
+  }
+  if (!parent.has(dst)) return null;
+  const steps = [];
+  let cur = dst;
+  while (cur !== src) {
+    const link = parent.get(cur);
+    steps.push(makeStep(link.prev, TAU, cur, link.id));
+    cur = link.prev;
+  }
+  return steps.reverse();
+}
+
+function cmpLex(xs, ys) {
+  const n = Math.min(xs.length, ys.length);
+  for (let i = 0; i < n; i += 1) {
+    if (xs[i] < ys[i]) return -1;
+    if (xs[i] > ys[i]) return 1;
+  }
+  return xs.length - ys.length;
+}
+
+// 还原一条实际的连续候选响应：先走静默前缀（0 条或多条已录入 tau 迁移），
+// 再由某个前缀终点经一条已录入的同动作迁移到达 target。
+// 存在多条静默前缀或分叉候选时，按（前缀步数、前缀状态序列、承接点、迁移标识）
+// 取字典序最小者，保证审查员可逐步复算。
 function responseRoute(proc, src, action, target) {
-  const directTargets = proc.out.get(src).get(action);
-  const direct = Boolean(directTargets && directTargets.has(target));
+  if (action === TAU) {
+    const steps = tauPath(proc, src, target) || [];
+    return {
+      start: src,
+      end: target,
+      action,
+      kind: steps.length === 0 ? 'IDLE' : 'WEAK',
+      steps,
+    };
+  }
+
+  let best = null;
+  for (const u of [...epsilonClosure(proc, src)].sort()) {
+    const ids = edgeIdsOf(proc, u, action, target);
+    if (!ids.length) continue;
+    const prefix = tauPath(proc, src, u);
+    if (prefix === null) continue;
+    const cand = {
+      prefixLen: prefix.length,
+      prefixStates: prefix.map((s) => s.to),
+      via: u,
+      transitionId: ids[0] || null,
+    };
+    if (!best || cmpCandidate(cand, best) < 0) best = cand;
+  }
+  if (!best) {
+    // 不应发生：target 必来自 weakTargets；防御性返回空路径
+    return { start: src, end: target, action, kind: 'WEAK', steps: [] };
+  }
+  const steps = [
+    ...tauPath(proc, src, best.via),
+    makeStep(best.via, action, target, best.transitionId),
+  ];
   return {
     start: src,
     end: target,
     action,
-    kind: direct ? 'DIRECT' : 'WEAK',
-    steps: [{ from: src, action, to: target }],
+    kind: best.prefixLen === 0 ? 'DIRECT' : 'WEAK',
+    steps,
   };
+}
+
+// 候选分叉时的确定性次序：前缀步数 → 前缀落点序列 → 承接点 → 承接迁移标识
+function cmpCandidate(x, y) {
+  if (x.prefixLen !== y.prefixLen) return x.prefixLen - y.prefixLen;
+  const seq = cmpLex(x.prefixStates, y.prefixStates);
+  if (seq !== 0) return seq;
+  if (x.via !== y.via) return x.via < y.via ? -1 : 1;
+  const xi = x.transitionId || '';
+  const yi = y.transitionId || '';
+  return xi < yi ? -1 : xi > yi ? 1 : 0;
 }
 
 // ---------- 按轮次淘汰 ----------

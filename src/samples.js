@@ -4,6 +4,9 @@
 //  1. equivalent —— 仅差一个可观察上不可见的 tau 自环（状态重命名），应判定等价
 //  2. missing    —— 一侧可观察动作另一侧无法承接，应判定不等价
 //  3. cascade    —— 多轮淘汰：初始对在第 2 轮因引用第 1 轮淘汰结果而失败
+//  4. silentPrefix —— 应答侧初态必须先经内部 tau 跳转才能承接 x，且两侧 x 后继
+//                     暴露不同可观察动作（p vs q）；初始对第 2 轮淘汰，候选响应
+//                     必须逐步回放为“tau 前缀 + 同动作 x”，每步对应已录入迁移。
 
 const samples = {
   equivalent: {
@@ -49,6 +52,26 @@ const samples = {
       states: [{ name: 'b0' }, { name: 'b1' }],
       initial: 'b0',
       transitions: [{ id: 'bx', from: 'b0', action: 'x', to: 'b1' }],
+    },
+  },
+  silentPrefix: {
+    label: '静默前缀后承接且后继动作不匹配（初始对第 2 轮淘汰，路径须逐步回放）',
+    procA: {
+      states: [{ name: 'a0' }, { name: 'a1' }, { name: 'a2' }],
+      initial: 'a0',
+      transitions: [
+        { id: 'ax', from: 'a0', action: 'x', to: 'a1' },
+        { id: 'ap', from: 'a1', action: 'p', to: 'a2' },
+      ],
+    },
+    procB: {
+      states: [{ name: 'b0' }, { name: 'b1' }, { name: 'b2' }, { name: 'b3' }],
+      initial: 'b0',
+      transitions: [
+        { id: 'bt', from: 'b0', action: 'tau', to: 'b1' },
+        { id: 'bx', from: 'b1', action: 'x', to: 'b2' },
+        { id: 'bq', from: 'b2', action: 'q', to: 'b3' },
+      ],
     },
   },
 };

@@ -6,7 +6,10 @@
 //   2) 代码测试：node --test
 //   3) 接口 / HTTP 冒烟：健康路径、页面、审计接口
 //      - 静默环等价规程：审计必须判定等价，关系含两个初始状态对
-//      - 缺失匹配动作规程：审计必须判定不等价，且失败依据只引用更早轮次
+//      - 静默前缀 + 后继不匹配规程：初始对第 2 轮淘汰，候选响应必须逐步连续
+//        （tau 前缀后承接同动作），每步对应已录入迁移；页面与接口契约一致
+//      - 直接动作 / 级联淘汰：直达候选响应为 DIRECT 单步，失败依据只引用更早轮次
+//      - 缺失匹配动作规程：审计必须判定不等价
 //      - 无效输入：一次返回全部问题并清除旧结论
 // 完成后退出：全部通过 0，任一失败 1。
 
@@ -93,6 +96,55 @@ async function postAudit(body) {
   return res.json();
 }
 
+// 复算不变量：候选响应必须逐步连续（起点=应答方状态、上一步落点=下一步起点、
+// 末点=响应落点），每一步（含迁移标识）都对应该应答侧一条已录入迁移；
+// 除末步承接同动作外，前缀只能由 tau 组成。
+function validateRoutesRecorded(j, specs) {
+  const edgeIndex = specs.map((spec) => {
+    const m = new Map();
+    for (const t of spec.transitions) {
+      const k = `${t.from}|${t.action}|${t.to}`;
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(t.id);
+    }
+    return m;
+  });
+  for (const ep of j.eliminatedPairs) {
+    if (!ep.transitions.some((t) => t.reason === 'ALL_RESPONSES_ELIMINATED')) continue;
+    const sideIdx = ep.responder === 'A' ? 0 : 1;
+    const responderState = ep.responder === 'A' ? ep.pair[0] : ep.pair[1];
+    const edges = edgeIndex[sideIdx];
+    for (const t of ep.transitions) {
+      if (t.reason !== 'ALL_RESPONSES_ELIMINATED') continue;
+      for (const w of t.responses) {
+        const steps = w.route.steps;
+        assert.ok(Array.isArray(steps), `候选响应步骤应为数组：${JSON.stringify(w.route)}`);
+        if (steps.length === 0) {
+          // 零步仅允许自反 tau 弱转移（IDLE）：起点即落点
+          assert.equal(w.route.kind, 'IDLE');
+          assert.equal(w.route.start, w.route.end);
+          assert.equal(w.route.end, w.target);
+          continue;
+        }
+        assert.equal(steps[0].from, responderState, '路径必须从应答方状态起步');
+        assert.equal(steps[0].from, w.route.start);
+        assert.equal(steps[steps.length - 1].to, w.route.end);
+        assert.equal(w.route.end, w.target);
+        for (let i = 1; i < steps.length; i += 1) {
+          assert.equal(steps[i - 1].to, steps[i].from, '候选响应必须逐步连续');
+        }
+        steps.forEach((s, i) => {
+          if (i < steps.length - 1) assert.equal(s.action, 'tau', '静默前缀只能由 tau 组成');
+          const ids = edges.get(`${s.from}|${s.action}|${s.to}`);
+          assert.ok(ids, `路径步骤不在应答侧已录入迁移中：${JSON.stringify(s)}`);
+          assert.ok(s.transitionId && ids.includes(s.transitionId),
+            `迁移标识无法定位已录入迁移：${JSON.stringify(s)}，候选 ${JSON.stringify(ids)}`);
+        });
+      }
+    }
+  }
+}
+
 (async () => {
   await astep('服务健康检查就绪 GET /healthz', async () => {
     await waitReady(BASE);
@@ -146,6 +198,69 @@ async function postAudit(body) {
           }
           const rounds = t.responses.map((w) => w.eliminatedRound);
           assert.deepEqual(rounds, [...rounds].sort((a, b) => b - a), '依据应按轮次递减');
+        }
+      }
+    }
+    // 直达候选响应：单步 DIRECT，迁移标识可在已录入迁移中定位
+    const p00 = j.eliminatedPairs.find((e) => e.pair[0] === 'a0' && e.pair[1] === 'b0');
+    const fail = p00.transitions.find((t) => t.source === 'a1');
+    assert.equal(fail.responses.length, 1);
+    const route = fail.responses[0].route;
+    assert.equal(route.kind, 'DIRECT');
+    assert.deepEqual(route.steps, [{ from: 'b0', action: 'x', to: 'b1', transitionId: 'bx' }]);
+  });
+
+  await astep('静默前缀+后继不匹配：初始对第 2 轮淘汰，候选响应逐步连续（tau→x）且对应已录入迁移', async () => {
+    const j = await postAudit(samples.silentPrefix);
+    assert.equal(j.ok, true);
+    assert.equal(j.equivalent, false);
+
+    const p00 = j.eliminatedPairs.find((e) => e.pair[0] === 'a0' && e.pair[1] === 'b0');
+    assert.ok(p00, '应存在初始状态对淘汰记录');
+    assert.equal(p00.round, 2, '初始对应在第 2 轮淘汰');
+    assert.equal(p00.action, 'x');
+    assert.equal(p00.challenger, 'A');
+    assert.equal(j.initialAlive[0], false);
+
+    const fail = p00.transitions.find((t) => t.source === 'a1');
+    assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+    assert.equal(fail.responses.length, 1);
+    const w = fail.responses[0];
+    assert.equal(w.target, 'b2');
+    assert.deepEqual(w.pair, ['a1', 'b2']);
+    assert.equal(w.eliminatedRound, 1);
+    // 实际连续候选响应：先内部跳转 bt，再承接同动作 bx；不得出现伪造的 b0 --x--> b2
+    assert.deepEqual(w.route.steps, [
+      { from: 'b0', action: 'tau', to: 'b1', transitionId: 'bt' },
+      { from: 'b1', action: 'x', to: 'b2', transitionId: 'bx' },
+    ]);
+    assert.equal(w.route.kind, 'WEAK');
+
+    // 全量复算：全部候选路径逐步连续，且每一步（含迁移标识）都在已录入迁移中
+    validateRoutesRecorded(j, [samples.silentPrefix.procA, samples.silentPrefix.procB]);
+  });
+
+  await astep('页面与审计接口一致：页面按 route.steps/transitionId 逐步回放候选响应', async () => {
+    // 接口返回
+    const j = await postAudit(samples.silentPrefix);
+    // 页面契约：渲染逻辑消费与接口相同的字段，且不再存在伪造直达的单步拼接
+    const res = await fetch(`${BASE}/`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    for (const token of ['renderRouteSteps', 'route.steps', 's.transitionId', '候选响应路径']) {
+      assert.ok(html.includes(token), `页面应包含逐步回放契约字段：${token}`);
+    }
+    // 页面脚本对每个候选响应逐行输出步骤；接口中所有响应路径字段完整
+    for (const ep of j.eliminatedPairs) {
+      for (const t of ep.transitions) {
+        if (t.reason !== 'ALL_RESPONSES_ELIMINATED') continue;
+        for (const w of t.responses) {
+          assert.ok(Array.isArray(w.route.steps) && w.route.steps.length >= 1);
+          for (const s of w.route.steps) {
+            for (const k of ['from', 'action', 'to', 'transitionId']) {
+              assert.ok(Object.prototype.hasOwnProperty.call(s, k), `路径步骤缺字段 ${k}`);
+            }
+          }
         }
       }
     }
