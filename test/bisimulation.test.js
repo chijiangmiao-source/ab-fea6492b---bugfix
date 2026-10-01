@@ -2,8 +2,27 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { audit, weakTargets, normalize, TAU } = require('../src/bisimulation');
+const { audit, weakTargets, normalize, TAU, responseRoute } = require('../src/bisimulation');
 const { samples } = require('../src/samples');
+
+// 以录入规程核对路径：每一步都必须对应一条已录入迁移，且逐步首尾相接
+function transitionIndex(spec) {
+  const map = new Map();
+  for (const t of spec.transitions) map.set(t.id, t);
+  return map;
+}
+function assertRouteIsRegistered(steps, spec) {
+  const byId = transitionIndex(spec);
+  for (let i = 0; i < steps.length; i += 1) {
+    const s = steps[i];
+    const t = byId.get(s.transitionId);
+    assert.ok(t, `步骤迁移标识必须已录入：${s.transitionId}`);
+    assert.equal(t.from, s.from, `迁移 ${s.transitionId} 起点须一致`);
+    assert.equal(t.action, s.action, `迁移 ${s.transitionId} 动作须一致`);
+    assert.equal(t.to, s.to, `迁移 ${s.transitionId} 终点须一致`);
+    if (i > 0) assert.equal(steps[i - 1].to, s.from, '候选响应必须逐步连续');
+  }
+}
 
 test('仅以 tau 环重命名而等价：关系包含两个初始状态对', () => {
   const r = audit(samples.equivalent.procA, samples.equivalent.procB);
@@ -28,6 +47,111 @@ test('缺失匹配动作：不等价，首个失败义务是缺失侧无法承�
   assert.equal(r.rounds[0].eliminated.length, 3);
   const initPair = r.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
   assert.equal(initPair.round, 1);
+});
+
+test('静默前缀且后继动作不匹配：初始对第 2 轮淘汰，候选响应须逐步回放真实迁移', () => {
+  const { procA, procB } = samples.silentPrefix;
+  const r = audit(procA, procB);
+  assert.equal(r.ok, true);
+  assert.equal(r.equivalent, false);
+
+  // 第 1 轮：x 后继 (a1,b2) 因可观察动作 p vs q 不匹配而淘汰
+  const p12 = r.eliminatedPairs.find((p) => p.pair[0] === 'a1' && p.pair[1] === 'b2');
+  assert.ok(p12, `应存在淘汰对 (a1,b2)：${JSON.stringify(r.eliminatedPairs.map((p) => p.pair))}`);
+  assert.equal(p12.round, 1);
+  assert.equal(p12.action, 'p');
+  assert.equal(p12.challenger, 'A');
+
+  // 初始对 (a0,b0) 在后续轮次（第 2 轮）才正确淘汰
+  const p00 = r.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
+  assert.ok(p00);
+  assert.equal(p00.round, 2);
+  assert.equal(p00.action, 'x');
+  assert.equal(p00.challenger, 'A');
+
+  // 候选响应必须展示实际连续路径：b0 --tau(bt)--> b1 --x(bx)--> b2，
+  // 而不是规程中不存在的 b0 --x--> b2 直达动作
+  const fail = p00.transitions.find((t) => t.source === 'a1');
+  assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+  assert.equal(fail.responses.length, 1);
+  const w = fail.responses[0];
+  assert.equal(w.target, 'b2');
+  assert.deepEqual(w.pair, ['a1', 'b2']);
+  assert.equal(w.eliminatedRound, 1);
+  assert.equal(w.route.kind, 'WEAK');
+  assert.equal(w.route.start, 'b0');
+  assert.equal(w.route.end, 'b2');
+  assert.deepEqual(
+    w.route.steps.map((s) => [s.from, s.action, s.to, s.transitionId]),
+    [['b0', 'tau', 'b1', 'bt'], ['b1', 'x', 'b2', 'bx']],
+  );
+  assertRouteIsRegistered(w.route.steps, procB);
+
+  // 全部失败义务的全部候选响应都须可逐步复算（含多静默前缀、分叉候选）
+  for (const ep of r.eliminatedPairs) {
+    const responderSpec = ep.challenger === 'A' ? procB : procA;
+    for (const t of ep.transitions) {
+      if (t.reason !== 'ALL_RESPONSES_ELIMINATED') continue;
+      for (const cand of t.responses) {
+        assert.equal(cand.route.start, ep.challenger === 'A' ? ep.pair[1] : ep.pair[0]);
+        assert.equal(cand.route.end, cand.target);
+        assertRouteIsRegistered(cand.route.steps, responderSpec);
+      }
+    }
+  }
+});
+
+test('responseRoute：直达迁移为 DIRECT 单步，弱承接为 tau 前缀 + 同动作迁移', () => {
+  const spec = {
+    states: [{ name: 's' }, { name: 'u' }, { name: 'p' }],
+    initial: 's',
+    transitions: [
+      { id: 't1', from: 's', action: 'tau', to: 'u' },
+      { id: 'a1', from: 'u', action: 'a', to: 'p' },
+    ],
+  };
+  const proc = normalize(spec);
+  const weak = responseRoute(proc, 's', 'a', 'p');
+  assert.equal(weak.kind, 'WEAK');
+  assert.deepEqual(weak.steps.map((s) => s.transitionId), ['t1', 'a1']);
+  assertRouteIsRegistered(weak.steps, spec);
+
+  const direct = responseRoute(proc, 'u', 'a', 'p');
+  assert.equal(direct.kind, 'DIRECT');
+  assert.deepEqual(direct.steps, [{ from: 'u', action: 'a', to: 'p', transitionId: 'a1' }]);
+
+  const tauRoute = responseRoute(proc, 's', TAU, 'u');
+  assert.deepEqual(tauRoute.steps, [{ from: 's', action: 'tau', to: 'u', transitionId: 't1' }]);
+  const stutter = responseRoute(proc, 's', TAU, 's');
+  assert.equal(stutter.kind, 'STUTTER');
+  assert.deepEqual(stutter.steps, []);
+});
+
+test('responseRoute：含静默环与多个静默前缀时路径确定且全部对应已录入迁移', () => {
+  const spec = {
+    states: [{ name: 's' }, { name: 'u' }, { name: 'v' }, { name: 'p' }],
+    initial: 's',
+    transitions: [
+      { id: 'loop', from: 's', action: 'tau', to: 's' }, // 静默环
+      { id: 'su', from: 's', action: 'tau', to: 'u' },
+      { id: 'uv', from: 'u', action: 'tau', to: 'v' },
+      { id: 'vs', from: 'v', action: 'tau', to: 's' },
+      { id: 'ap1', from: 'v', action: 'a', to: 'p' },
+      { id: 'ap2', from: 'v', action: 'a', to: 'p' }, // 同端点分叉：取最小标识 ap1
+    ],
+  };
+  const proc = normalize(spec);
+  const route = responseRoute(proc, 's', 'a', 'p');
+  assert.equal(route.kind, 'WEAK');
+  // BFS 字典序展开：s -> u -> v，静默环不参与生成树
+  assert.deepEqual(route.steps.map((s) => [s.from, s.action, s.to, s.transitionId]), [
+    ['s', 'tau', 'u', 'su'],
+    ['u', 'tau', 'v', 'uv'],
+    ['v', 'a', 'p', 'ap1'],
+  ]);
+  assertRouteIsRegistered(route.steps, spec);
+  // 确定性：重复复算结果一致
+  assert.deepEqual(responseRoute(proc, 's', 'a', 'p'), route);
 });
 
 test('多轮级联：初始对第 2 轮淘汰，失败义务只引用第 1 轮淘汰对', () => {

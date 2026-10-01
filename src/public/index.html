@@ -58,6 +58,7 @@
       <option value="equivalent">tau 自环 + 重命名（应等价）</option>
       <option value="missing">缺失匹配动作（应不等价）</option>
       <option value="cascade">多轮级联淘汰（初始对第 2 轮失败）</option>
+      <option value="silentPrefix">静默前缀后承接 x（候选响应须逐步回放）</option>
     </select>
     <button class="ghost" id="loadBtn">载入</button>
     <span style="flex:1"></span>
@@ -156,15 +157,23 @@ function renderFirst(r) {
   </div>`;
 }
 
+function renderRouteSteps(w) {
+  if (!w.route.steps.length) return '<span class="muted">零步静默（同一状态）</span>';
+  return w.route.steps.map((s) => {
+    const silent = s.action === 'tau';
+    return `<span class="mono">${esc(s.from)} --${silent ? '<b>tau</b>' : esc(s.action)}[${esc(s.transitionId)}]--&gt; ${esc(s.to)}</span>`;
+  }).join('<br>');
+}
+
 function renderTransitions(f) {
   const rows = f.transitions.map((t) => {
     let detail;
     if (t.reason === 'NO_MATCHING_ACTION') {
       detail = '<span class="muted">应答侧无该动作的任何（弱）转移可承接</span>';
     } else {
-      detail = '<details open><summary>候选响应（依据按轮次递减，仅引用更早轮次淘汰结果）</summary><table>'
-        + '<tr><th>响应路径</th><th>响应落点</th><th>落点状态对</th><th>淘汰轮次</th></tr>'
-        + t.responses.map((w) => `<tr><td class="mono">${w.route.steps.map((s) => `${esc(s.from)} --${esc(s.action)}--&gt; ${esc(s.to)}`).join('，')}</td><td class="mono">${esc(w.target)}</td><td class="mono">(${esc(w.pair[0])}, ${esc(w.pair[1])})</td><td>第 ${w.eliminatedRound} 轮</td></tr>`).join('')
+      detail = '<details open><summary>候选响应（依据按轮次递减，仅引用更早轮次淘汰结果；每步对应已录入迁移，逐步连续）</summary><table>'
+        + '<tr><th>候选响应路径（逐步回放）</th><th>类型</th><th>响应落点</th><th>落点状态对</th><th>淘汰轮次</th></tr>'
+        + t.responses.map((w) => `<tr><td>${renderRouteSteps(w)}</td><td><span class="tag">${esc(w.route.kind)}</span></td><td class="mono">${esc(w.target)}</td><td class="mono">(${esc(w.pair[0])}, ${esc(w.pair[1])})</td><td>第 ${w.eliminatedRound} 轮</td></tr>`).join('')
         + '</table></details>';
     }
     return `<tr><td class="mono">${esc(f.challenger)}.${esc(t.source)} --${esc(f.action)}--&gt;</td><td>${detail}</td></tr>`;

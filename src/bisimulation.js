@@ -87,6 +87,8 @@ function validateSpec(spec, side) {
 
 // ---------- 规范化 ----------
 
+// 规范化：保留每条迁移的标识，使候选响应路径的每一步都能对应已录入迁移。
+// out: from -> action -> [{ id, to }]（按 to、id 稳定排序，去重判定仍以落点状态为准）
 function normalize(spec) {
   const names = spec.states.map((s) => (typeof s === 'string' ? s : s.name)).sort();
   const stateSet = new Set(names);
@@ -95,26 +97,32 @@ function normalize(spec) {
   for (const t of spec.transitions) {
     if (!stateSet.has(t.from) || !stateSet.has(t.to) || typeof t.action !== 'string' || !t.action) continue;
     actions.add(t.action);
-    if (!out.get(t.from).has(t.action)) out.get(t.from).set(t.action, new Set());
-    out.get(t.from).get(t.action).add(t.to);
+    if (!out.get(t.from).has(t.action)) out.get(t.from).set(t.action, []);
+    out.get(t.from).get(t.action).push({ id: t.id, to: t.to });
+  }
+  for (const byAction of out.values()) {
+    for (const list of byAction.values()) {
+      list.sort((r1, r2) => (r1.to < r2.to ? -1 : r1.to > r2.to ? 1 : r1.id < r2.id ? -1 : r1.id > r2.id ? 1 : 0));
+    }
   }
   return { names, stateSet, actions, out, initial: spec.initial };
 }
 
 // ---------- 弱转移 ----------
 
+function tauRecords(proc, u) {
+  return (proc.out.get(u) && proc.out.get(u).get(TAU)) || [];
+}
+
 function epsilonClosure(proc, src) {
   const seen = new Set([src]);
   const stack = [src];
   while (stack.length) {
     const u = stack.pop();
-    const tauTargets = proc.out.get(u) && proc.out.get(u).get(TAU);
-    if (tauTargets) {
-      for (const v of tauTargets) {
-        if (!seen.has(v)) {
-          seen.add(v);
-          stack.push(v);
-        }
+    for (const r of tauRecords(proc, u)) {
+      if (!seen.has(r.to)) {
+        seen.add(r.to);
+        stack.push(r.to);
       }
     }
   }
@@ -129,21 +137,90 @@ function weakTargets(proc, src, action) {
   }
   for (const u of epsilonClosure(proc, src)) {
     const ts = proc.out.get(u).get(action);
-    if (ts) for (const p of ts) result.add(p);
+    if (ts) for (const r of ts) result.add(r.to);
   }
   return result;
 }
 
+// 确定性静默前缀树：自 src 沿 tau 迁移的 BFS 生成树。
+// 同层后继按状态名字典序展开（多条同端点 tau 取最小迁移标识），
+// 因而在含静默环、多个静默前缀或分叉候选时路径仍可唯一复算。
+function epsilonTree(proc, src) {
+  const parent = new Map([[src, { via: null, tid: null }]]);
+  const queue = [src];
+  for (let i = 0; i < queue.length; i += 1) {
+    const u = queue[i];
+    const nextStates = [...new Set(tauRecords(proc, u).map((r) => r.to))].sort();
+    for (const v of nextStates) {
+      if (!parent.has(v)) {
+        const rec = tauRecords(proc, u).find((r) => r.to === v);
+        parent.set(v, { via: u, tid: rec.id });
+        queue.push(v);
+      }
+    }
+  }
+  return parent;
+}
+
+function treePath(tree, src, dest) {
+  const states = [];
+  const tids = [];
+  let cur = dest;
+  while (cur !== src) {
+    const node = tree.get(cur);
+    states.push(cur);
+    tids.push(node.tid);
+    cur = node.via;
+  }
+  states.push(src);
+  states.reverse();
+  tids.reverse();
+  return { states, tids };
+}
+
+function cmpSeq(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return a.length - b.length;
+}
+
+// 候选响应的实际连续路径：先走（0 条或多条）已录入的 tau 迁移到达承接点 u，
+// 再由 u 经一条已录入的同动作迁移到达落点 target。每一步都带迁移标识，
+// 且 steps[i].to === steps[i+1].from，审查员可据此逐步回放淘汰依据。
+//   kind: DIRECT 单步直达迁移；WEAK 经静默前缀；STUTTER 零步静默（tau 自承接）
 function responseRoute(proc, src, action, target) {
-  const directTargets = proc.out.get(src).get(action);
-  const direct = Boolean(directTargets && directTargets.has(target));
-  return {
-    start: src,
-    end: target,
-    action,
-    kind: direct ? 'DIRECT' : 'WEAK',
-    steps: [{ from: src, action, to: target }],
-  };
+  if (action === TAU) {
+    if (src === target) return { start: src, end: target, action, kind: 'STUTTER', steps: [] };
+    const path = treePath(epsilonTree(proc, src), src, target);
+    const steps = path.states.slice(1).map((v, i) => ({
+      from: path.states[i], action: TAU, to: v, transitionId: path.tids[i],
+    }));
+    return { start: src, end: target, action, kind: steps.length === 1 ? 'DIRECT' : 'WEAK', steps };
+  }
+
+  const tree = epsilonTree(proc, src);
+  const candidates = [];
+  for (const u of proc.names) {
+    if (!tree.has(u)) continue;
+    const recs = proc.out.get(u).get(action);
+    if (!recs) continue;
+    const hits = recs.filter((r) => r.to === target);
+    if (!hits.length) continue;
+    // 分叉候选：承接点按静默前缀状态序列字典序确定；同端点多条迁移取最小标识
+    candidates.push({ u, prefix: treePath(tree, src, u), tid: hits.map((r) => r.id).sort()[0] });
+  }
+  // target 来自 weakTargets，至少存在一个承接候选
+  candidates.sort((c1, c2) => cmpSeq(c1.prefix.states, c2.prefix.states));
+  const c = candidates[0];
+
+  const steps = c.prefix.states.slice(1).map((v, i) => ({
+    from: c.prefix.states[i], action: TAU, to: v, transitionId: c.prefix.tids[i],
+  }));
+  steps.push({ from: c.u, action, to: target, transitionId: c.tid });
+  return { start: src, end: target, action, kind: steps.length === 1 ? 'DIRECT' : 'WEAK', steps };
 }
 
 // ---------- 按轮次淘汰 ----------
